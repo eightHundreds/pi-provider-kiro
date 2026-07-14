@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { filterModelsByRegion, KIRO_MODEL_IDS, kiroModels, resolveApiRegion, resolveKiroModel } from "../src/models.js";
+import {
+  filterModelsByRegion,
+  KIRO_MODEL_IDS,
+  kiroModels,
+  resolveApiRegion,
+  resolveKiroModel,
+  toKiroModelDefinition,
+} from "../src/models.js";
 
 describe("Feature 2: Model Definitions", () => {
   describe("resolveKiroModel", () => {
@@ -28,8 +35,8 @@ describe("Feature 2: Model Definitions", () => {
   });
 
   describe("KIRO_MODEL_IDS", () => {
-    it("contains 14 model IDs", () => {
-      expect(KIRO_MODEL_IDS.size).toBe(14);
+    it("contains 17 model IDs", () => {
+      expect(KIRO_MODEL_IDS.size).toBe(17);
     });
   });
 
@@ -113,6 +120,69 @@ describe("Feature 2: Model Definitions", () => {
     it("non-Claude models (except auto) have 8K max tokens", () => {
       const nonClaudeModels = kiroModels.filter((m) => !m.id.startsWith("claude-") && m.id !== "auto");
       expect(nonClaudeModels.every((m) => m.maxTokens === 8192)).toBe(true);
+    });
+  });
+
+  describe("dynamic model metadata", () => {
+    it("uses API token limits, input types, and native reasoning schema", () => {
+      const model = toKiroModelDefinition(
+        {
+          modelId: "gpt-5.6-sol",
+          modelName: "GPT 5.6 Sol",
+          supportedInputTypes: ["TEXT", "IMAGE"],
+          tokenLimits: { maxInputTokens: 272000, maxOutputTokens: 128000 },
+          additionalModelRequestFieldsSchema: {
+            properties: {
+              reasoning: {
+                properties: {
+                  mode: { enum: ["standard", "pro"], default: "standard" },
+                  effort: { enum: ["none", "low", "medium", "high", "xhigh", "max"], default: "high" },
+                },
+              },
+            },
+          },
+        },
+        "https://q.us-east-1.amazonaws.com",
+      );
+
+      expect(model).toMatchObject({
+        id: "gpt-5-6-sol",
+        name: "GPT 5.6 Sol",
+        reasoning: true,
+        input: ["text", "image"],
+        contextWindow: 272000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: "none",
+          minimal: "low",
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+        },
+        kiroReasoning: {
+          mode: "standard",
+          efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+        },
+      });
+    });
+
+    it("does not claim native reasoning support when the API omits its schema", () => {
+      const model = toKiroModelDefinition(
+        {
+          modelId: "glm-5",
+          modelName: "GLM 5",
+          supportedInputTypes: ["TEXT"],
+          tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 },
+          additionalModelRequestFieldsSchema: null,
+        },
+        "https://q.us-east-1.amazonaws.com",
+      );
+
+      expect(model.reasoning).toBe(false);
+      expect(model.thinkingLevelMap).toBeUndefined();
+      expect(model.kiroReasoning).toBeUndefined();
+      expect(model.maxTokens).toBe(64000);
     });
   });
 

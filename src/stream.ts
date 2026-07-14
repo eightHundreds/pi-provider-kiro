@@ -24,6 +24,7 @@ import { debugEnabled, debugLog } from "./debug.js";
 import { parseKiroEvent } from "./event-parser.js";
 import { addPlaceholderTools, HISTORY_LIMIT, HISTORY_LIMIT_CONTEXT_WINDOW, truncateHistory } from "./history.js";
 import { getKiroCliCredentials, getKiroCliCredentialsAllowExpired, refreshViaKiroCli } from "./kiro-cli.js";
+import type { KiroModel } from "./models.js";
 import { resolveKiroModel } from "./models.js";
 import {
   capacityRetryConfig,
@@ -105,6 +106,12 @@ interface KiroRequest {
   };
   profileArn?: string;
   agentMode?: string;
+  additionalModelRequestFields?: {
+    reasoning: {
+      mode: string;
+      effort: string;
+    };
+  };
 }
 interface KiroToolCallState {
   toolUseId: string;
@@ -248,7 +255,18 @@ export function streamKiro(
       }
 
       const kiroModelId = resolveKiroModel(model.id);
-      const thinkingEnabled = !!options?.reasoning || model.reasoning;
+      const kiroModel = model as KiroModel;
+      const nativeReasoning = kiroModel.kiroReasoning;
+      const requestedLevel = options?.reasoning;
+      const mappedEffort = requestedLevel
+        ? (model.thinkingLevelMap?.[requestedLevel] ?? requestedLevel)
+        : model.thinkingLevelMap?.off;
+      const nativeEffort = nativeReasoning
+        ? (mappedEffort ?? (nativeReasoning.efforts.includes("none") ? "none" : undefined))
+        : undefined;
+      const thinkingEnabled = nativeReasoning
+        ? nativeEffort !== undefined && nativeEffort !== "none"
+        : requestedLevel !== undefined;
       debugLog("request.init", {
         endpoint,
         model: model.id,
@@ -256,6 +274,7 @@ export function streamKiro(
         contextWindow: model.contextWindow,
         thinkingEnabled,
         reasoning: options?.reasoning,
+        nativeReasoning: nativeReasoning ? { mode: nativeReasoning.mode, effort: nativeEffort } : undefined,
         messageCount: context.messages.length,
         toolCount: context.tools?.length ?? 0,
         hasSystemPrompt: !!context.systemPrompt,
@@ -263,13 +282,13 @@ export function streamKiro(
         sessionId: options?.sessionId,
       });
       let systemPrompt = context.systemPrompt ?? "";
-      if (thinkingEnabled) {
+      if (thinkingEnabled && !nativeReasoning) {
         const budget =
-          options?.reasoning === "xhigh"
+          requestedLevel === "xhigh"
             ? 50000
-            : options?.reasoning === "high"
+            : requestedLevel === "high"
               ? 30000
-              : options?.reasoning === "medium"
+              : requestedLevel === "medium"
                 ? 20000
                 : 10000;
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
@@ -416,6 +435,16 @@ export function streamKiro(
           },
           ...(profileArn ? { profileArn } : {}),
           agentMode: "vibe",
+          ...(nativeReasoning && nativeEffort
+            ? {
+                additionalModelRequestFields: {
+                  reasoning: {
+                    mode: nativeReasoning.mode,
+                    effort: nativeEffort,
+                  },
+                },
+              }
+            : {}),
         };
         let response!: Response;
         // Reset per outer iteration — each 403 retry gets a fresh capacity budget

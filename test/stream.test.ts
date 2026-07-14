@@ -207,6 +207,78 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("sends native reasoning effort for models discovered with a reasoning schema", async () => {
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const model = makeModel({
+      id: "gpt-5-6-sol",
+      name: "GPT 5.6 Sol",
+      reasoning: true,
+      thinkingLevelMap: {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+      },
+      kiroReasoning: {
+        mode: "standard",
+        efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+      },
+    } as Partial<Model<Api>>);
+    await collect(streamKiro(model, makeContext(), { apiKey: "tok", reasoning: "xhigh" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.additionalModelRequestFields).toEqual({
+      reasoning: { mode: "standard", effort: "xhigh" },
+    });
+    expect(body.conversationState.currentMessage.userInputMessage.content).not.toContain("<thinking_mode>");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("sends effort none when native reasoning is switched off", async () => {
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const model = makeModel({
+      id: "gpt-5-6-sol",
+      name: "GPT 5.6 Sol",
+      reasoning: true,
+      thinkingLevelMap: { off: "none", xhigh: "xhigh" },
+      kiroReasoning: {
+        mode: "standard",
+        efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+      },
+    } as Partial<Model<Api>>);
+    await collect(streamKiro(model, makeContext(), { apiKey: "tok" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.additionalModelRequestFields).toEqual({
+      reasoning: { mode: "standard", effort: "none" },
+    });
+    expect(body.conversationState.currentMessage.userInputMessage.content).not.toContain("<thinking_mode>");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps XML thinking tags as a compatibility path for legacy reasoning models", async () => {
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok", reasoning: "high" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.additionalModelRequestFields).toBeUndefined();
+    expect(body.conversationState.currentMessage.userInputMessage.content).toContain(
+      "<thinking_mode>enabled</thinking_mode><max_thinking_length>30000</max_thinking_length>",
+    );
+
+    vi.unstubAllGlobals();
+  });
+
   it("sets stopReason to toolUse when tool calls are present", async () => {
     const toolPayload = '{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}';
     const mockFetch = mockFetchOk(`${toolPayload}{"contextUsagePercentage":20}`);
@@ -290,7 +362,10 @@ describe("Feature 9: Streaming Integration", () => {
     ]);
     vi.stubGlobal("fetch", mockFetch);
 
-    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), {
+      apiKey: "tok",
+      reasoning: "high",
+    });
     const events = await collect(stream);
     const types = events.map((e) => e.type);
 

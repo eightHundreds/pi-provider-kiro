@@ -3,8 +3,95 @@
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { Model, ThinkingLevelMap } from "@earendil-works/pi-ai";
 
 const CACHE_PATH = join(homedir(), ".kiro-models-cache.json");
+
+export interface KiroReasoningConfig {
+  mode: string;
+  efforts: string[];
+}
+
+export type KiroModel = Model<"kiro-api"> & {
+  firstTokenTimeout?: number;
+  kiroReasoning?: KiroReasoningConfig;
+};
+
+interface AvailableKiroModel {
+  modelId: string;
+  modelName?: string;
+  supportedInputTypes?: string[];
+  tokenLimits?: {
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+  };
+  additionalModelRequestFieldsSchema?: {
+    properties?: {
+      reasoning?: {
+        properties?: {
+          mode?: { enum?: string[]; default?: string };
+          effort?: { enum?: string[]; default?: string };
+        };
+      };
+    };
+  } | null;
+}
+
+function reasoningConfig(model: AvailableKiroModel): KiroReasoningConfig | undefined {
+  const reasoning = model.additionalModelRequestFieldsSchema?.properties?.reasoning?.properties;
+  const efforts = reasoning?.effort?.enum?.filter((value): value is string => typeof value === "string") ?? [];
+  if (efforts.length === 0) return undefined;
+  return {
+    mode: reasoning?.mode?.default ?? reasoning?.mode?.enum?.[0] ?? "standard",
+    efforts,
+  };
+}
+
+function effortMap(config: KiroReasoningConfig): ThinkingLevelMap {
+  const supported = new Set(config.efforts);
+  const choose = (...values: string[]): string | null => values.find((value) => supported.has(value)) ?? null;
+  return {
+    off: choose("none"),
+    minimal: choose("minimal", "low"),
+    low: choose("low"),
+    medium: choose("medium"),
+    high: choose("high"),
+    xhigh: choose("xhigh", "max"),
+  };
+}
+
+export function toKiroModelDefinition(model: AvailableKiroModel, qHost: string): KiroModel {
+  const piId = model.modelId.replace(/(\d)\.(\d)/g, "$1-$2");
+  const existing = kiroModels.find((candidate) => candidate.id === piId);
+  const nativeReasoning = reasoningConfig(model);
+  const input = (model.supportedInputTypes ?? ["TEXT"])
+    .map((type) => type.toLowerCase())
+    .filter((type): type is "text" | "image" => type === "text" || type === "image");
+
+  return {
+    ...(existing ?? {
+      id: piId,
+      name: model.modelName ?? piId,
+      api: "kiro-api" as const,
+      provider: "kiro",
+      baseUrl: `${qHost}/generateAssistantResponse`,
+      reasoning: false,
+      input: ["text"],
+      cost: ZERO_COST,
+      contextWindow: 200000,
+      maxTokens: 8192,
+    }),
+    id: piId,
+    name: model.modelName ?? existing?.name ?? piId,
+    baseUrl: `${qHost}/generateAssistantResponse`,
+    reasoning: nativeReasoning !== undefined,
+    thinkingLevelMap: nativeReasoning ? effortMap(nativeReasoning) : undefined,
+    input: input.length > 0 ? input : (existing?.input ?? ["text"]),
+    contextWindow: model.tokenLimits?.maxInputTokens ?? existing?.contextWindow ?? 200000,
+    maxTokens: model.tokenLimits?.maxOutputTokens ?? existing?.maxTokens ?? 8192,
+    kiroReasoning: nativeReasoning,
+  };
+}
 
 // Valid Kiro model IDs - API accepts friendly names directly
 export const KIRO_MODEL_IDS = new Set([
@@ -30,7 +117,7 @@ export function loadCachedModelIds(): void {
   if (!existsSync(CACHE_PATH)) return;
   try {
     const raw = readFileSync(CACHE_PATH, "utf-8");
-    const data = JSON.parse(raw) as Record<string, typeof kiroModels>;
+    const data = JSON.parse(raw) as Record<string, KiroModel[]>;
     for (const regionModels of Object.values(data)) {
       if (Array.isArray(regionModels)) {
         for (const m of regionModels) {
@@ -47,11 +134,11 @@ export function loadCachedModelIds(): void {
   }
 }
 
-export function getCachedModels(region: string): typeof kiroModels {
+export function getCachedModels(region: string): KiroModel[] {
   if (existsSync(CACHE_PATH)) {
     try {
       const raw = readFileSync(CACHE_PATH, "utf-8");
-      const data = JSON.parse(raw) as Record<string, typeof kiroModels>;
+      const data = JSON.parse(raw) as Record<string, KiroModel[]>;
       if (data && Array.isArray(data[region])) {
         return data[region];
       }
@@ -89,6 +176,8 @@ export async function updateKiroModelsCache(accessToken: string, region: string,
       method: "GET",
       headers: {
         Authorization: `Bearer ${accessToken}`,
+        "User-Agent": "KiroIDE",
+        "x-amz-user-agent": "KiroIDE",
       },
     });
 
@@ -96,40 +185,11 @@ export async function updateKiroModelsCache(accessToken: string, region: string,
       return;
     }
 
-    const data = (await response.json()) as { models?: Array<{ modelId: string }> };
+    const data = (await response.json()) as { models?: AvailableKiroModel[] };
     const fetchedModels = data.models || [];
     if (fetchedModels.length === 0) return;
 
-    const newModels = fetchedModels.map((fm) => {
-      const kiroId = fm.modelId;
-      const piId = kiroId.replace(/(\d)\.(\d)/g, "$1-$2");
-
-      const existing = kiroModels.find((m) => m.id === piId);
-      if (existing) {
-        return existing;
-      }
-
-      const isClaude = piId.startsWith("claude");
-      const isReasoning =
-        piId.includes("opus") || piId.includes("sonnet") || piId.includes("coder") || piId.includes("deepseek");
-      const name = piId
-        .split("-")
-        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-        .join(" ");
-
-      return {
-        id: piId,
-        name: name,
-        api: "kiro-api" as const,
-        provider: "kiro" as const,
-        baseUrl: `${qHost}/generateAssistantResponse`,
-        reasoning: isReasoning,
-        input: isClaude ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),
-        cost: ZERO_COST,
-        contextWindow: isClaude ? 1000000 : 200000,
-        maxTokens: isClaude ? 65536 : 8192,
-      };
-    });
+    const newModels = fetchedModels.map((model) => toKiroModelDefinition(model, qHost));
 
     if (!newModels.some((m) => m.id === "auto")) {
       newModels.push({
@@ -146,7 +206,7 @@ export async function updateKiroModelsCache(accessToken: string, region: string,
       });
     }
 
-    let cache: Record<string, typeof kiroModels> = {};
+    let cache: Record<string, KiroModel[]> = {};
     if (existsSync(CACHE_PATH)) {
       try {
         cache = JSON.parse(readFileSync(CACHE_PATH, "utf-8"));
@@ -264,7 +324,7 @@ export function filterModelsByRegion<T extends { id: string }>(models: T[], apiR
 const BASE_URL = "https://q.us-east-1.amazonaws.com/generateAssistantResponse";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
-export const kiroModels = [
+export const kiroModels: KiroModel[] = [
   {
     id: "claude-opus-4-8",
     name: "Claude Opus 4.8",
